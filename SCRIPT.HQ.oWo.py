@@ -1,26 +1,32 @@
 print("SCRIPT STARTED")
 import discord
+from discord import app_commands
 from discord.ext import commands
 import random, json, time, os
 
-TOKEN = os.getenv("DISCORD_TOKEN")  # Use environment variable in Railway!
-PREFIX = ","
+TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+
+class Bot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        await self.tree.sync()
+        print("✅ Slash commands synced")
+
+bot = Bot()
 
 DATA_FILE = "data.json"
-
 START_COINS = 1000
 DAILY_COINS = 500
 MAX_BET = 5000
 BET_COOLDOWN = 8
+XP_COOLDOWN = 30
+BASE_XP = 1000
 
-XP_COOLDOWN = 30  # seconds between XP gains
-BASE_XP = 1000    # level 1 requirement
-
-# create json file if missing
 if not os.path.exists(DATA_FILE):
     with open(DATA_FILE, "w") as f:
         json.dump({}, f)
@@ -54,9 +60,8 @@ def get_user(data, gid, uid):
 
 @bot.event
 async def on_ready():
-    print(f"Online as {bot.user}")
+    print(f"✅ Online as {bot.user}")
 
-# ---------- XP SYSTEM ----------
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild:
@@ -83,73 +88,125 @@ async def on_message(message):
     save(data)
     await bot.process_commands(message)
 
-# ---------- STATS ----------
-@bot.command()
-async def stats(ctx):
-    data = load()
-    u = get_user(data, ctx.guild.id, ctx.author.id)
-    await ctx.send(
-        f"📊 **Stats for {ctx.author.name}**\n"
-        f"Level: **{u['level']}**\n"
-        f"XP: **{u['xp']} / {xp_needed(u['level'])}**\n"
-        f"Coins: **{u['coins']}**"
-    )
+# ==================== SLASH COMMANDS ====================
 
-# ---------- DAILY ----------
-@bot.command()
-async def daily(ctx):
+@bot.tree.command(name="stats", description="View your stats and level")
+async def stats(interaction: discord.Interaction):
     data = load()
-    user = get_user(data, ctx.guild.id, ctx.author.id)
+    u = get_user(data, interaction.guild.id, interaction.user.id)
+    
+    embed = discord.Embed(title=f"📊 Stats for {interaction.user.name}", color=discord.Color.blue())
+    embed.add_field(name="Level", value=f"**{u['level']}**", inline=True)
+    embed.add_field(name="XP", value=f"**{u['xp']} / {xp_needed(u['level'])}**", inline=True)
+    embed.add_field(name="Coins", value=f"**{u['coins']}** 💰", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="daily", description="Claim your daily coins")
+async def daily(interaction: discord.Interaction):
+    data = load()
+    user = get_user(data, interaction.guild.id, interaction.user.id)
     now = time.time()
 
     if now - user["last_daily"] < 86400:
-        await ctx.send("🕒 Already claimed.")
+        remaining = 86400 - (now - user["last_daily"])
+        hours = int(remaining // 3600)
+        minutes = int((remaining % 3600) // 60)
+        await interaction.response.send_message(f"🕒 Already claimed! Come back in {hours}h {minutes}m", ephemeral=True)
         return
 
     user["last_daily"] = now
     user["coins"] += DAILY_COINS
     save(data)
-    await ctx.send(f"🧧 You got **{DAILY_COINS} coins**")
+    await interaction.response.send_message(f"🧧 You claimed **{DAILY_COINS} coins**! 💰")
 
-# -----------------------------
-# GAMBLING COMMANDS
-# -----------------------------
-GAMBLE_COOLDOWN = 8  # seconds
+@bot.tree.command(name="money", description="Check your coin balance")
+async def money(interaction: discord.Interaction):
+    data = load()
+    user = get_user(data, interaction.guild.id, interaction.user.id)
+    await interaction.response.send_message(f"💰 {interaction.user.mention}, you have **{user['coins']} coins**")
 
-# COIN FLIP / BET
-@bot.command()
-async def bet(ctx, amount: int):
-    data = load()  # Load data first
-    user = get_user(data, ctx.guild.id, ctx.author.id)
+# ==================== BET BUTTONS ====================
+
+class BetView(discord.ui.View):
+    def __init__(self, user_id, guild_id, amount):
+        super().__init__(timeout=30)
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.amount = amount
+        self.used = False
+
+    @discord.ui.button(label="🪙 Heads", style=discord.ButtonStyle.primary)
+    async def heads(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id or self.used:
+            await interaction.response.send_message("Not your bet!", ephemeral=True)
+            return
+        
+        self.used = True
+        data = load()
+        user = get_user(data, self.guild_id, self.user_id)
+        
+        result = random.choice(["heads", "tails"])
+        won = result == "heads"
+        
+        if won:
+            user["coins"] += self.amount
+            msg = f"🎉 It's **HEADS**! You WON **{self.amount} coins**!"
+        else:
+            user["coins"] -= self.amount
+            msg = f"💥 It's **TAILS**! You LOST **{self.amount} coins**!"
+        
+        save(data)
+        await interaction.response.edit_message(content=msg, view=None)
+
+    @discord.ui.button(label="🪙 Tails", style=discord.ButtonStyle.danger)
+    async def tails(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id or self.used:
+            await interaction.response.send_message("Not your bet!", ephemeral=True)
+            return
+        
+        self.used = True
+        data = load()
+        user = get_user(data, self.guild_id, self.user_id)
+        
+        result = random.choice(["heads", "tails"])
+        won = result == "tails"
+        
+        if won:
+            user["coins"] += self.amount
+            msg = f"🎉 It's **TAILS**! You WON **{self.amount} coins**!"
+        else:
+            user["coins"] -= self.amount
+            msg = f"💥 It's **HEADS**! You LOST **{self.amount} coins**!"
+        
+        save(data)
+        await interaction.response.edit_message(content=msg, view=None)
+
+@bot.tree.command(name="bet", description="Flip a coin - choose heads or tails!")
+@app_commands.describe(amount="Amount of coins to bet")
+async def bet(interaction: discord.Interaction, amount: int):
+    data = load()
+    user = get_user(data, interaction.guild.id, interaction.user.id)
     now = time.time()
 
-    if now - user["last_bet"] < GAMBLE_COOLDOWN:
-        await ctx.send("⏳ Cooldown.")
+    if now - user["last_bet"] < BET_COOLDOWN:
+        await interaction.response.send_message("⏳ Cooldown active!", ephemeral=True)
         return
 
     if amount <= 0 or amount > user["coins"] or amount > MAX_BET:
-        await ctx.send("❌ Invalid bet.")
+        await interaction.response.send_message("❌ Invalid bet amount!", ephemeral=True)
         return
 
     user["last_bet"] = now
-    if random.choice([True, False]):
-        user["coins"] += amount
-        result = f"🎉 You WON **{amount} coins**!"
-    else:
-        user["coins"] -= amount
-        result = f"💥 You LOST **{amount} coins**!"
+    save(data)
+    
+    view = BetView(interaction.user.id, interaction.guild.id, amount)
+    await interaction.response.send_message(f"🪙 Choose **Heads** or **Tails**! Betting **{amount} coins**", view=view)
 
-    save(data)  # Fixed: save the data variable instead of save(load())
-    await ctx.send(result)
-
-# -----------------------------
-# PRAY / LUCK COMMAND
-# -----------------------------
-@bot.command()
-async def pray(ctx):
-    """Pray for luck! Small chance for coins or XP."""
+@bot.tree.command(name="pray", description="Pray for luck!")
+async def pray(interaction: discord.Interaction):
     data = load()
-    user = get_user(data, ctx.guild.id, ctx.author.id)
+    user = get_user(data, interaction.guild.id, interaction.user.id)
     reward_type = random.choice(["coins", "xp", "nothing"])
     
     if reward_type == "coins":
@@ -161,109 +218,169 @@ async def pray(ctx):
         user["xp"] += amount
         msg = f"🙏 The gods blessed your knowledge! You gained **{amount} XP**!"
     else:
-        msg = f"😔 The gods ignored your prayer this time. Better luck next time!"
+        msg = "😔 The gods ignored your prayer this time. Better luck next time!"
 
     save(data)
-    await ctx.send(msg)
+    await interaction.response.send_message(msg)
 
-# ---------- MONEY ----------
-@bot.command()
-async def money(ctx):
-    """Check your coin balance"""
-    data = load()
-    user = get_user(data, ctx.guild.id, ctx.author.id)
-    await ctx.send(f"💰 {ctx.author.mention}, you have **{user['coins']} coins**")
+# ==================== SLOTS BUTTON ====================
 
-# SLOTS
-@bot.command()
-async def slots(ctx, amount: int):
-    data = load()
-    user = get_user(data, ctx.guild.id, ctx.author.id)
-
-    if amount <= 0 or amount > user["coins"]:
-        await ctx.send("❌ Invalid bet.")
-        return
-
-    reels = ["🍒", "🍋", "🍉", "⭐", "💎"]
-    spin = [random.choice(reels) for _ in range(3)]
-
-    if len(set(spin)) == 1:  # jackpot
-        win = amount * 3
-        user["coins"] += win
-        result = f"🎰 {' '.join(spin)}\n**JACKPOT! You win {win} coins!**"
-    else:
-        user["coins"] -= amount
-        result = f"🎰 {' '.join(spin)}\n**You lost {amount} coins.**"
-
-    save(data)
-    await ctx.send(result)
-
-class BlackjackView(discord.ui.View):
-    def __init__(self, author, guild_id, bet, player, dealer):
-        super().__init__(timeout=60)
-        self.author = author
+class SlotsView(discord.ui.View):
+    def __init__(self, user_id, guild_id, amount):
+        super().__init__(timeout=30)
+        self.user_id = user_id
         self.guild_id = guild_id
-        self.bet = bet
-        self.player = player
-        self.dealer = dealer
+        self.amount = amount
 
-    async def interaction_check(self, interaction):
-        return interaction.user == self.author
-
-    async def finish(self, interaction):
-        while hand_value(self.dealer) < 17:
-            self.dealer.append(draw_card())
-
-        p = hand_value(self.player)
-        d = hand_value(self.dealer)
-
+    @discord.ui.button(label="🎰 SPIN", style=discord.ButtonStyle.success, emoji="🎰")
+    async def spin(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Not your game!", ephemeral=True)
+            return
+        
         data = load()
-        user = get_user(data, self.guild_id, self.author.id)
+        user = get_user(data, self.guild_id, self.user_id)
+        
+        if self.amount > user["coins"]:
+            await interaction.response.send_message("❌ Not enough coins!", ephemeral=True)
+            return
 
-        if p > 21:
-            result = "💥 Bust! You lost."
-            user["coins"] -= self.bet
-        elif d > 21 or p > d:
-            result = "🎉 You win!"
-            user["coins"] += self.bet
-        elif p == d:
-            result = "😐 Push (tie)"
+        reels = ["🍒", "🍋", "🍉", "⭐", "💎"]
+        spin = [random.choice(reels) for _ in range(3)]
+
+        if len(set(spin)) == 1:
+            win = self.amount * 3
+            user["coins"] += win
+            result = f"🎰 {' '.join(spin)}\n\n✨ **JACKPOT! You win {win} coins!** ✨"
         else:
-            result = "💀 Dealer wins."
-            user["coins"] -= self.bet
+            user["coins"] -= self.amount
+            result = f"🎰 {' '.join(spin)}\n\n💥 You lost {self.amount} coins."
 
         save(data)
-        self.clear_items()
+        await interaction.response.edit_message(content=result, view=None)
 
-        await interaction.response.edit_message(
-            content=(
-                f"🃏 **Blackjack**\n\n"
-                f"Your hand: `{self.player}` = **{p}**\n"
-                f"Dealer: `{self.dealer}` = **{d}**\n\n"
-                f"{result}"
-            ),
-            view=self
-        )
+@bot.tree.command(name="slots", description="Try your luck at the slot machine!")
+@app_commands.describe(amount="Amount of coins to bet")
+async def slots(interaction: discord.Interaction, amount: int):
+    data = load()
+    user = get_user(data, interaction.guild.id, interaction.user.id)
 
-    @discord.ui.button(label="Hit", style=discord.ButtonStyle.green)
-    async def hit(self, interaction, button):
-        self.player.append(draw_card())
-        if hand_value(self.player) >= 21:
-            await self.finish(interaction)
+    if amount <= 0 or amount > user["coins"]:
+        await interaction.response.send_message("❌ Invalid bet amount!", ephemeral=True)
+        return
+
+    view = SlotsView(interaction.user.id, interaction.guild.id, amount)
+    await interaction.response.send_message(f"🎰 **Slot Machine** 🎰\nBetting: **{amount} coins**\n\nPress SPIN to play!", view=view)
+
+# ==================== BLACKJACK ====================
+
+def draw_card():
+    return random.choice([2,3,4,5,6,7,8,9,10,10,10,10,11])
+
+def hand_value(hand):
+    value = sum(hand)
+    aces = hand.count(11)
+    while value > 21 and aces:
+        value -= 10
+        aces -= 1
+    return value
+
+class BlackjackView(discord.ui.View):
+    def __init__(self, user_id, guild_id, bet_amount, player_hand, dealer_hand):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.bet_amount = bet_amount
+        self.player_hand = player_hand
+        self.dealer_hand = dealer_hand
+        self.finished = False
+
+    @discord.ui.button(label="Hit", style=discord.ButtonStyle.green, emoji="🃏")
+    async def hit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your game!", ephemeral=True)
+            return
+        
+        if self.finished:
+            await interaction.response.send_message("Game already finished!", ephemeral=True)
+            return
+
+        self.player_hand.append(draw_card())
+        player_val = hand_value(self.player_hand)
+
+        if player_val > 21:
+            self.finished = True
+            data = load()
+            user = get_user(data, self.guild_id, self.user_id)
+            user["coins"] -= self.bet_amount
+            save(data)
+            
+            await interaction.response.edit_message(
+                content=f"🃏 **Blackjack**\n\nYour hand: {self.player_hand} = **{player_val}**\n\n💥 **BUST! You lost {self.bet_amount} coins!**",
+                view=None
+            )
         else:
             await interaction.response.edit_message(
-                content=(
-                    f"🃏 **Blackjack**\n\n"
-                    f"Your hand: `{self.player}` = **{hand_value(self.player)}**\n"
-                    f"Dealer: `{self.dealer[0]}`, ?"
-                ),
+                content=f"🃏 **Blackjack**\n\nYour hand: {self.player_hand} = **{player_val}**\nDealer: [{self.dealer_hand[0]}, ?]",
                 view=self
             )
 
-    @discord.ui.button(label="Stand", style=discord.ButtonStyle.red)
-    async def stand(self, interaction, button):
-        await self.finish(interaction)
+    @discord.ui.button(label="Stand", style=discord.ButtonStyle.red, emoji="✋")
+    async def stand_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your game!", ephemeral=True)
+            return
+        
+        if self.finished:
+            await interaction.response.send_message("Game already finished!", ephemeral=True)
+            return
 
+        self.finished = True
+        
+        while hand_value(self.dealer_hand) < 17:
+            self.dealer_hand.append(draw_card())
+
+        player_val = hand_value(self.player_hand)
+        dealer_val = hand_value(self.dealer_hand)
+
+        data = load()
+        user = get_user(data, self.guild_id, self.user_id)
+
+        if dealer_val > 21 or player_val > dealer_val:
+            user["coins"] += self.bet_amount
+            result = f"🎉 **You WIN {self.bet_amount} coins!**"
+        elif player_val < dealer_val:
+            user["coins"] -= self.bet_amount
+            result = f"💥 **Dealer wins! You lost {self.bet_amount} coins!**"
+        else:
+            result = "🤝 **Push! It's a tie.**"
+
+        save(data)
+        
+        await interaction.response.edit_message(
+            content=f"🃏 **Blackjack**\n\nYour hand: {self.player_hand} = **{player_val}**\nDealer: {self.dealer_hand} = **{dealer_val}**\n\n{result}",
+            view=None
+        )
+
+@bot.tree.command(name="blackjack", description="Play blackjack against the dealer!")
+@app_commands.describe(amount="Amount of coins to bet")
+async def blackjack(interaction: discord.Interaction, amount: int):
+    data = load()
+    user = get_user(data, interaction.guild.id, interaction.user.id)
+
+    if amount <= 0 or amount > user["coins"]:
+        await interaction.response.send_message("❌ Invalid bet amount!", ephemeral=True)
+        return
+
+    player = [draw_card(), draw_card()]
+    dealer = [draw_card(), draw_card()]
+
+    view = BlackjackView(interaction.user.id, interaction.guild.id, amount, player, dealer)
+
+    await interaction.response.send_message(
+        f"🃏 **Blackjack**\n\nYour hand: {player} = **{hand_value(player)}**\nDealer: [{dealer[0]}, ?]",
+        view=view
+    )
 
 # Run the bot
 bot.run(TOKEN)
